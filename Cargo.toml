@@ -11,7 +11,7 @@ license-file = "LICENSE"
 documentation = "https://docs.rs/face_id"
 
 [dependencies]
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["api-24", "ndarray", "std"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["api-22", "ndarray", "std"] }
 ndarray = "0.17.2"
 nalgebra = { version = "0.34.1", default-features = false, features = ["std"] }
 thiserror = "2.0.18"
