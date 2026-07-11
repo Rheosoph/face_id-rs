@@ -1,6 +1,7 @@
 #![allow(clippy::similar_names)]
 use crate::detector::BoundingBox;
 use crate::error::FaceIdError;
+use crate::face_align::bilinear_sample;
 #[cfg(feature = "hf-hub")]
 use crate::model_manager::{HfModel, get_hf_model};
 use bon::bon;
@@ -53,7 +54,17 @@ impl GenderAgeEstimator {
             .with_execution_providers(with_execution_providers)?
             .commit_from_file(model_path)?;
 
-        let input_name = session.inputs()[0].name().to_string();
+        let input_name = session
+            .inputs()
+            .first()
+            .ok_or_else(|| FaceIdError::InvalidModel("Gender/age model has no inputs".into()))?
+            .name()
+            .to_string();
+        if session.outputs().is_empty() {
+            return Err(FaceIdError::InvalidModel(
+                "Gender/age model has no outputs".into(),
+            ));
+        }
 
         Ok(Self {
             session,
@@ -76,7 +87,10 @@ impl GenderAgeEstimator {
             .session
             .run(ort::inputs![&self.input_name => input_value])?;
 
-        let output_tensor = outputs[0].try_extract_array::<f32>()?;
+        let output = outputs.values().next().ok_or_else(|| {
+            FaceIdError::InvalidModel("Gender/age model produced no outputs".into())
+        })?;
+        let output_tensor = output.try_extract_array::<f32>()?;
         let batch_size = face_imgs.len();
 
         if output_tensor.ndim() != 2
@@ -95,6 +109,12 @@ impl GenderAgeEstimator {
             let prob_female = output_tensor[[i, 0]];
             let prob_male = output_tensor[[i, 1]];
             let age_raw = output_tensor[[i, 2]];
+
+            if !prob_female.is_finite() || !prob_male.is_finite() || !age_raw.is_finite() {
+                return Err(FaceIdError::InvalidModel(format!(
+                    "Gender/age model produced non-finite values for batch item {i}"
+                )));
+            }
 
             let gender = if prob_male > prob_female {
                 Gender::Male
@@ -132,52 +152,45 @@ impl GenderAgeEstimator {
         output_size: u32,
     ) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
         let (img_w, img_h) = img.dimensions();
-        let bbox = bbox.scale(img_w, img_h);
+        let mut output = ImageBuffer::new(output_size, output_size);
+        if output_size == 0
+            || img_w == 0
+            || img_h == 0
+            || !bbox.x1.is_finite()
+            || !bbox.y1.is_finite()
+            || !bbox.x2.is_finite()
+            || !bbox.y2.is_finite()
+        {
+            return output;
+        }
 
-        let w = bbox.width();
-        let h = bbox.height();
-        let cx = bbox.x1 + w / 2.0;
-        let cy = bbox.y1 + h / 2.0;
+        let x1 = bbox.x1.clamp(0.0, 1.0) * img_w as f32;
+        let y1 = bbox.y1.clamp(0.0, 1.0) * img_h as f32;
+        let x2 = bbox.x2.clamp(0.0, 1.0) * img_w as f32;
+        let y2 = bbox.y2.clamp(0.0, 1.0) * img_h as f32;
+        let width = x2 - x1;
+        let height = y2 - y1;
+        if width <= 0.0 || height <= 0.0 {
+            return output;
+        }
 
-        // Use 1.5x the largest dimension to create a square crop
-        let side = w.max(h) * 1.5;
+        let cx = (x1 + x2) * 0.5;
+        let cy = (y1 + y2) * 0.5;
+        let side = width.max(height) * 1.5;
+        let sample_scale = side / output_size as f32;
+        let output_center = output_size as f32 * 0.5;
 
-        let x1 = (cx - side / 2.0) as i32;
-        let y1 = (cy - side / 2.0) as i32;
-        let side_u = side as u32;
-
-        // We use a canvas to handle out-of-bounds crops (padding with black)
-        let mut canvas = ImageBuffer::new(side_u, side_u);
-
-        // Calculate the overlap between the desired crop and the actual image
-        let src_x = x1.max(0) as u32;
-        let src_y = y1.max(0) as u32;
-        let src_x2 = (x1 + side_u.cast_signed()).min(img_w.cast_signed()) as u32;
-        let src_y2 = (y1 + side_u.cast_signed()).min(img_h.cast_signed()) as u32;
-
-        if src_x2 > src_x && src_y2 > src_y {
-            let width = src_x2 - src_x;
-            let height = src_y2 - src_y;
-
-            // Manual copy from buffer to canvas
-            for y in 0..height {
-                for x in 0..width {
-                    let pixel = img.get_pixel(src_x + x, src_y + y);
-                    let dst_x = (src_x.cast_signed() - x1) as u32 + x;
-                    let dst_y = (src_y.cast_signed() - y1) as u32 + y;
-                    canvas.put_pixel(dst_x, dst_y, *pixel);
-                }
+        // Sample directly into the model-sized output using the same integer-coordinate mapping
+        // as OpenCV's `warpAffine`. This keeps memory bounded and pads out-of-bounds pixels black.
+        for py in 0..output_size {
+            let src_y = (py as f32 - output_center).mul_add(sample_scale, cy);
+            for px in 0..output_size {
+                let src_x = (px as f32 - output_center).mul_add(sample_scale, cx);
+                output.put_pixel(px, py, bilinear_sample(img, src_x, src_y, img_w, img_h));
             }
         }
 
-        // Resize the padded square crop to the model input size (96x96)
-        DynamicImage::ImageRgb8(canvas)
-            .resize_exact(
-                output_size,
-                output_size,
-                image::imageops::FilterType::Triangle,
-            )
-            .to_rgb8()
+        output
     }
 
     fn create_input_tensor_batch(
@@ -202,11 +215,12 @@ impl GenderAgeEstimator {
             let raw = img.as_raw();
             let batch_offset = batch_idx * 3 * channel_stride;
 
-            // Buffalo-L attribute genderage.onnx expects: BGR channel order, 0-255 range
+            // InsightFace creates an RGB blob (`swapRB=true`) from OpenCV's BGR image.
+            // `image` already stores RGB, so preserve the channel order here.
             for (i, chunk) in raw.chunks_exact(3).enumerate() {
-                data[batch_offset + i] = f32::from(chunk[2]); // B
+                data[batch_offset + i] = f32::from(chunk[0]); // R
                 data[batch_offset + i + channel_stride] = f32::from(chunk[1]); // G
-                data[batch_offset + i + 2 * channel_stride] = f32::from(chunk[0]); // R
+                data[batch_offset + i + 2 * channel_stride] = f32::from(chunk[2]); // B
             }
         }
 
@@ -217,5 +231,37 @@ impl GenderAgeEstimator {
         img: &ImageBuffer<Rgb<u8>, Vec<u8>>,
     ) -> Result<Array4<f32>, FaceIdError> {
         Self::create_input_tensor_batch(std::slice::from_ref(img))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_tensor_preserves_rgb_channel_order() {
+        let mut img = ImageBuffer::from_pixel(96, 96, Rgb([0, 0, 0]));
+        img.put_pixel(0, 0, Rgb([10, 20, 30]));
+
+        let tensor = GenderAgeEstimator::create_input_tensor(&img).unwrap();
+
+        assert!((tensor[[0, 0, 0, 0]] - 10.0).abs() < f32::EPSILON);
+        assert!((tensor[[0, 1, 0, 0]] - 20.0).abs() < f32::EPSILON);
+        assert!((tensor[[0, 2, 0, 0]] - 30.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn crop_memory_is_bounded_by_output_size() {
+        let img = ImageBuffer::from_pixel(2, 2, Rgb([255, 255, 255]));
+        let bbox = BoundingBox {
+            x1: -1.0e20,
+            y1: -1.0e20,
+            x2: 1.0e20,
+            y2: 1.0e20,
+        };
+
+        let crop = GenderAgeEstimator::align_crop(&img, &bbox, 96);
+
+        assert_eq!(crop.dimensions(), (96, 96));
     }
 }

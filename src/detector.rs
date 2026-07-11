@@ -134,10 +134,31 @@ impl ScrfdDetector {
         #[builder(default = 0.4)] iou_threshold: f32,
         #[builder(default = &[])] with_execution_providers: &[ExecutionProviderDispatch],
     ) -> Result<Self, FaceIdError> {
+        if input_size.0 == 0 || input_size.1 == 0 {
+            return Err(FaceIdError::InvalidModel(
+                "Detector input dimensions must be non-zero".into(),
+            ));
+        }
+        if !score_threshold.is_finite() || !(0.0..=1.0).contains(&score_threshold) {
+            return Err(FaceIdError::InvalidModel(format!(
+                "Detector score threshold must be finite and between 0 and 1, got {score_threshold}"
+            )));
+        }
+        if !iou_threshold.is_finite() || !(0.0..=1.0).contains(&iou_threshold) {
+            return Err(FaceIdError::InvalidModel(format!(
+                "Detector IoU threshold must be finite and between 0 and 1, got {iou_threshold}"
+            )));
+        }
+
         let session = Session::builder()?
             .with_execution_providers(with_execution_providers)?
             .commit_from_file(model_path)?;
-        let input_name = session.inputs()[0].name().to_string();
+        let input_name = session
+            .inputs()
+            .first()
+            .ok_or_else(|| FaceIdError::InvalidModel("Detector has no inputs".into()))?
+            .name()
+            .to_string();
         let config = DetectorConfig {
             input_size,
             score_threshold,
@@ -201,14 +222,25 @@ impl ScrfdDetector {
                 .filter_map(|output| output.name().strip_prefix("score_")?.parse::<i32>().ok())
                 .collect();
             strides.sort_unstable();
+            if strides.iter().any(|stride| *stride <= 0) {
+                return Err(FaceIdError::InvalidModel(
+                    "Detector output strides must be positive".into(),
+                ));
+            }
 
             for stride in strides {
                 let kps_name = format!("kps_{stride}");
                 let has_kps = session.outputs().iter().any(|o| o.name() == kps_name);
+                let bbox_name = format!("bbox_{stride}");
+                if !session.outputs().iter().any(|o| o.name() == bbox_name) {
+                    return Err(FaceIdError::InvalidModel(format!(
+                        "Missing output: {bbox_name}"
+                    )));
+                }
                 output_maps.push(OutputMap {
                     stride,
                     score_name: format!("score_{stride}"),
-                    bbox_name: format!("bbox_{stride}"),
+                    bbox_name,
                     kps_name: if has_kps { Some(kps_name) } else { None },
                 });
             }
@@ -266,6 +298,11 @@ impl ScrfdDetector {
     }
 
     pub fn detect(&mut self, img: &DynamicImage) -> Result<Vec<DetectedFace>, FaceIdError> {
+        if img.width() == 0 || img.height() == 0 {
+            return Err(FaceIdError::InvalidModel(
+                "Cannot run face detection on an empty image".into(),
+            ));
+        }
         let (processed_img, params) = self.preprocess(img);
         let input_tensor = self.create_input_tensor(&processed_img)?;
         let input_value = Value::from_array(input_tensor)?;
@@ -309,14 +346,14 @@ impl ScrfdDetector {
         let resized = img.resize_exact(w_new, h_new, image::imageops::FilterType::CatmullRom);
 
         let mut padded = ImageBuffer::new(w_in, h_in);
-        let x_offset = (w_in - w_new) as f32 / 2.0;
-        let y_offset = (h_in - h_new) as f32 / 2.0;
+        let x_offset = (w_in - w_new) / 2;
+        let y_offset = (h_in - h_new) / 2;
 
         image::imageops::overlay(
             &mut padded,
             &resized.to_rgb8(),
-            x_offset as i64,
-            y_offset as i64,
+            i64::from(x_offset),
+            i64::from(y_offset),
         );
 
         (
@@ -324,8 +361,8 @@ impl ScrfdDetector {
             PreprocessParams {
                 resized_width: w_new as f32,
                 resized_height: h_new as f32,
-                x_offset,
-                y_offset,
+                x_offset: x_offset as f32,
+                y_offset: y_offset as f32,
             },
         )
     }
@@ -375,42 +412,75 @@ impl ScrfdDetector {
                 None
             };
 
-            let anchors = &anchors_list[idx];
+            let anchors = anchors_list.get(idx).ok_or_else(|| {
+                FaceIdError::InvalidModel(format!(
+                    "Missing anchors for detector stride {}",
+                    map.stride
+                ))
+            })?;
+            Self::validate_output_shapes(map, &scores, &bboxes, kps.as_ref(), anchors)?;
             let stride_f = map.stride as f32;
 
             for i in 0..scores.nrows() {
                 let score = scores[[i, 0]];
+                if !score.is_finite() {
+                    return Err(FaceIdError::InvalidModel(format!(
+                        "Detector produced a non-finite score at row {i}"
+                    )));
+                }
                 if score < config.score_threshold {
                     continue;
                 }
 
                 let dist = bboxes.slice(s![i, ..]);
+                if dist.iter().take(4).any(|value| !value.is_finite()) {
+                    return Err(FaceIdError::InvalidModel(format!(
+                        "Detector produced non-finite bounding-box values at row {i}"
+                    )));
+                }
                 let anchor = anchors.slice(s![i, ..]);
                 let anchor_x = anchor[0];
                 let anchor_y = anchor[1];
 
-                let x1 =
-                    (dist[0].mul_add(-stride_f, anchor_x) - params.x_offset) / params.resized_width;
+                let x1 = ((dist[0].mul_add(-stride_f, anchor_x) - params.x_offset)
+                    / params.resized_width)
+                    .clamp(0.0, 1.0);
                 let y1 = (dist[1].mul_add(-stride_f, anchor_y) - params.y_offset)
                     / params.resized_height;
-                let x2 =
-                    (dist[2].mul_add(stride_f, anchor_x) - params.x_offset) / params.resized_width;
-                let y2 =
-                    (dist[3].mul_add(stride_f, anchor_y) - params.y_offset) / params.resized_height;
+                let y1 = y1.clamp(0.0, 1.0);
+                let x2 = ((dist[2].mul_add(stride_f, anchor_x) - params.x_offset)
+                    / params.resized_width)
+                    .clamp(0.0, 1.0);
+                let y2 = ((dist[3].mul_add(stride_f, anchor_y) - params.y_offset)
+                    / params.resized_height)
+                    .clamp(0.0, 1.0);
 
-                let landmarks = kps.as_ref().map(|kps_tensor| {
-                    let kps_dist = kps_tensor.slice(s![i, ..]);
-                    let mut lms = Vec::with_capacity(5);
-                    for j in 0..5 {
-                        let lx = (kps_dist[j * 2].mul_add(stride_f, anchor_x) - params.x_offset)
-                            / params.resized_width;
-                        let ly = (kps_dist[j * 2 + 1].mul_add(stride_f, anchor_y)
-                            - params.y_offset)
-                            / params.resized_height;
-                        lms.push((lx, ly));
-                    }
-                    lms
-                });
+                if x2 <= x1 || y2 <= y1 {
+                    continue;
+                }
+
+                let landmarks = kps
+                    .as_ref()
+                    .map(|kps_tensor| -> Result<_, FaceIdError> {
+                        let kps_dist = kps_tensor.slice(s![i, ..]);
+                        if kps_dist.iter().take(10).any(|value| !value.is_finite()) {
+                            return Err(FaceIdError::InvalidModel(format!(
+                                "Detector produced non-finite keypoints at row {i}"
+                            )));
+                        }
+                        let mut lms = Vec::with_capacity(5);
+                        for j in 0..5 {
+                            let lx = (kps_dist[j * 2].mul_add(stride_f, anchor_x)
+                                - params.x_offset)
+                                / params.resized_width;
+                            let ly = (kps_dist[j * 2 + 1].mul_add(stride_f, anchor_y)
+                                - params.y_offset)
+                                / params.resized_height;
+                            lms.push((lx.clamp(0.0, 1.0), ly.clamp(0.0, 1.0)));
+                        }
+                        Ok(lms)
+                    })
+                    .transpose()?;
 
                 candidate_faces.push(DetectedFace {
                     bbox: BoundingBox { x1, y1, x2, y2 },
@@ -424,6 +494,46 @@ impl ScrfdDetector {
             candidate_faces,
             config.iou_threshold,
         ))
+    }
+
+    fn validate_output_shapes(
+        map: &OutputMap,
+        scores: &Array2<f32>,
+        bboxes: &Array2<f32>,
+        keypoints: Option<&Array2<f32>>,
+        anchors: &Array2<f32>,
+    ) -> Result<(), FaceIdError> {
+        if scores.ncols() < 1 {
+            return Err(FaceIdError::InvalidModel(format!(
+                "Score output {} has no columns",
+                map.score_name
+            )));
+        }
+        if bboxes.nrows() != scores.nrows() || bboxes.ncols() < 4 {
+            return Err(FaceIdError::InvalidModel(format!(
+                "Bounding-box output {} has shape {:?}, expected [{}, >=4]",
+                map.bbox_name,
+                bboxes.shape(),
+                scores.nrows()
+            )));
+        }
+        if anchors.nrows() < scores.nrows() || anchors.ncols() != 2 {
+            return Err(FaceIdError::InvalidModel(format!(
+                "Anchor shape {:?} is incompatible with {} score rows",
+                anchors.shape(),
+                scores.nrows()
+            )));
+        }
+        if let Some(keypoints) = keypoints
+            && (keypoints.nrows() != scores.nrows() || keypoints.ncols() < 10)
+        {
+            return Err(FaceIdError::InvalidModel(format!(
+                "Keypoint output has shape {:?}, expected [{}, >=10]",
+                keypoints.shape(),
+                scores.nrows()
+            )));
+        }
+        Ok(())
     }
 
     fn perform_non_maximum_suppression(
@@ -454,7 +564,10 @@ impl ScrfdDetector {
         outputs: &SessionOutputs,
         key: &str,
     ) -> Result<Array2<f32>, FaceIdError> {
-        let array = outputs[key].try_extract_array::<f32>()?;
+        let output = outputs.get(key).ok_or_else(|| {
+            FaceIdError::InvalidModel(format!("Detector did not produce output {key}"))
+        })?;
+        let array = output.try_extract_array::<f32>()?;
         if array.ndim() == 3 {
             if array.shape()[0] != 1 {
                 return Err(FaceIdError::Ort(format!(
@@ -484,5 +597,66 @@ impl ScrfdDetector {
         }
 
         intersection / (a.area() + b.area() - intersection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn face(bbox: BoundingBox, score: f32) -> DetectedFace {
+        DetectedFace {
+            bbox,
+            landmarks: None,
+            score,
+        }
+    }
+
+    #[test]
+    fn non_maximum_suppression_removes_lower_scored_overlap() {
+        let first = BoundingBox {
+            x1: 0.1,
+            y1: 0.1,
+            x2: 0.5,
+            y2: 0.5,
+        };
+        let overlap = BoundingBox {
+            x1: 0.11,
+            y1: 0.11,
+            x2: 0.49,
+            y2: 0.49,
+        };
+        let separate = BoundingBox {
+            x1: 0.6,
+            y1: 0.6,
+            x2: 0.9,
+            y2: 0.9,
+        };
+
+        let kept = ScrfdDetector::perform_non_maximum_suppression(
+            vec![face(overlap, 0.8), face(first, 0.9), face(separate, 0.7)],
+            0.4,
+        );
+
+        assert_eq!(kept.len(), 2);
+        assert!((kept[0].score - 0.9).abs() < f32::EPSILON);
+        assert!((kept[1].score - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn output_validation_rejects_mismatched_rows() {
+        let map = OutputMap {
+            stride: 8,
+            score_name: "score_8".into(),
+            bbox_name: "bbox_8".into(),
+            kps_name: None,
+        };
+        let scores = Array2::zeros((2, 1));
+        let bboxes = Array2::zeros((1, 4));
+        let anchors = Array2::zeros((2, 2));
+
+        assert!(
+            ScrfdDetector::validate_output_shapes(&map, &scores, &bboxes, None, &anchors).is_err()
+        );
     }
 }

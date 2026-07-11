@@ -184,8 +184,22 @@ fn warp_affine(
 /// Sample a pixel from `img` at floating-point coordinates `(x, y)` using bilinear interpolation.
 /// Returns black for out-of-bounds coordinates.
 #[inline]
-fn bilinear_sample(img: &ImageBuffer<Rgb<u8>, Vec<u8>>, x: f32, y: f32, w: u32, h: u32) -> Rgb<u8> {
-    if x < 0.0 || y < 0.0 || x >= w as f32 || y >= h as f32 {
+pub(crate) fn bilinear_sample(
+    img: &ImageBuffer<Rgb<u8>, Vec<u8>>,
+    x: f32,
+    y: f32,
+    w: u32,
+    h: u32,
+) -> Rgb<u8> {
+    if w == 0
+        || h == 0
+        || !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x >= w as f32
+        || y >= h as f32
+    {
         return Rgb([0, 0, 0]);
     }
     let x0 = x.floor() as u32;

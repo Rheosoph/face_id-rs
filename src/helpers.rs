@@ -7,6 +7,7 @@ use crate::error::FaceIdError;
 #[cfg(feature = "clustering")]
 use hdbscan::{DistanceMetric, Hdbscan, HdbscanHyperParams, NnAlgorithm};
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb};
+#[cfg(feature = "clustering")]
 use rayon::prelude::*;
 #[cfg(feature = "clustering")]
 use std::collections::HashMap;
@@ -28,43 +29,87 @@ pub fn extract_face_thumbnail(
     size: u32,
 ) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
     let (img_w, img_h) = img.dimensions();
-    let bbox = bbox.scale(img_w, img_h);
-
-    let width = bbox.width();
-    let height = bbox.height();
-    let cx = bbox.x1 + width / 2.0;
-    let cy = bbox.y1 + height / 2.0;
-
-    // Determine the size of our square crop "side"
-    let side = width.max(height) * padding_factor;
-
-    // Calculate the theoretical coordinates of the crop
-    let x1 = (cx - side / 2.0).round() as i32;
-    let y1 = (cy - side / 2.0).round() as i32;
-    let side_u = side.round() as u32;
-
-    // Calculate intersection between the crop and the actual image
-    let src_x1 = x1.max(0) as u32;
-    let src_y1 = y1.max(0) as u32;
-    let src_x2 = (x1 + side_u.cast_signed()).min(img_w.cast_signed()) as u32;
-    let src_y2 = (y1 + side_u.cast_signed()).min(img_h.cast_signed()) as u32;
-
-    if src_x2 > src_x1 && src_y2 > src_y1 {
-        let crop_w = src_x2 - src_x1;
-        let crop_h = src_y2 - src_y1;
-
-        // Extract the valid part of the image
-        let sub_img = img.view(src_x1, src_y1, crop_w, crop_h).to_image();
-
-        // Use resize instead of resize_exact to maintain the aspect ratio if it's not square
-        DynamicImage::ImageRgba8(sub_img)
-            .resize(size, size, image::imageops::FilterType::CatmullRom)
-            .to_rgb8()
-    } else {
-        // Fallback: This case shouldn't be hit with a valid bounding box that is within the image.
-        // We'll return a small empty image to satisfy the return type.
-        ImageBuffer::new(size, size)
+    let mut output = ImageBuffer::new(size, size);
+    if size == 0
+        || img_w == 0
+        || img_h == 0
+        || !padding_factor.is_finite()
+        || padding_factor <= 0.0
+        || !bbox.x1.is_finite()
+        || !bbox.y1.is_finite()
+        || !bbox.x2.is_finite()
+        || !bbox.y2.is_finite()
+    {
+        return output;
     }
+
+    let x1 = bbox.x1.clamp(0.0, 1.0) * img_w as f32;
+    let y1 = bbox.y1.clamp(0.0, 1.0) * img_h as f32;
+    let x2 = bbox.x2.clamp(0.0, 1.0) * img_w as f32;
+    let y2 = bbox.y2.clamp(0.0, 1.0) * img_h as f32;
+    let width = x2 - x1;
+    let height = y2 - y1;
+    if width <= 0.0 || height <= 0.0 {
+        return output;
+    }
+
+    let cx = (x1 + x2) * 0.5;
+    let cy = (y1 + y2) * 0.5;
+    let side = width.max(height) * padding_factor;
+    let crop_x = cx - side * 0.5;
+    let crop_y = cy - side * 0.5;
+    let sample_scale = side / size as f32;
+
+    for py in 0..size {
+        let src_y = (py as f32 + 0.5).mul_add(sample_scale, crop_y) - 0.5;
+        for px in 0..size {
+            let src_x = (px as f32 + 0.5).mul_add(sample_scale, crop_x) - 0.5;
+            output.put_pixel(
+                px,
+                py,
+                bilinear_sample_dynamic(img, src_x, src_y, img_w, img_h),
+            );
+        }
+    }
+
+    output
+}
+
+#[inline]
+fn bilinear_sample_dynamic(img: &DynamicImage, x: f32, y: f32, width: u32, height: u32) -> Rgb<u8> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x >= width as f32
+        || y >= height as f32
+    {
+        return Rgb([0, 0, 0]);
+    }
+
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let p00 = img.get_pixel(x0, y0);
+    let p10 = img.get_pixel(x1, y0);
+    let p01 = img.get_pixel(x0, y1);
+    let p11 = img.get_pixel(x1, y1);
+
+    Rgb([
+        bilerp(p00[0], p10[0], p01[0], p11[0], fx, fy),
+        bilerp(p00[1], p10[1], p01[1], p11[1], fx, fy),
+        bilerp(p00[2], p10[2], p01[2], p11[2], fx, fy),
+    ])
+}
+
+#[inline]
+fn bilerp(c00: u8, c10: u8, c01: u8, c11: u8, fx: f32, fy: f32) -> u8 {
+    let top = (f32::from(c10) - f32::from(c00)).mul_add(fx, f32::from(c00));
+    let bottom = (f32::from(c11) - f32::from(c01)).mul_add(fx, f32::from(c01));
+    (bottom - top).mul_add(fy, top) as u8
 }
 
 /// Clusters faces from a list of images using the HDBSCAN algorithm.
@@ -95,7 +140,7 @@ pub fn cluster_faces<P: AsRef<Path> + Sync + Send>(
     #[builder(default = DistanceMetric::Euclidean)] dist_metric: DistanceMetric,
     #[builder(default = NnAlgorithm::Auto)] nn_algo: NnAlgorithm,
 ) -> Result<HashMap<i32, Vec<(PathBuf, FaceAnalysis)>>, FaceIdError> {
-    let all_faces: Vec<(PathBuf, FaceAnalysis)> = paths
+    let mut all_faces: Vec<(PathBuf, FaceAnalysis)> = paths
         .into_par_iter()
         .map(
             |path_ref| -> Result<Vec<(PathBuf, FaceAnalysis)>, FaceIdError> {
@@ -114,10 +159,12 @@ pub fn cluster_faces<P: AsRef<Path> + Sync + Send>(
         return Ok(HashMap::new());
     }
 
-    let (embeddings, face_refs): (Vec<Vec<f32>>, Vec<&(PathBuf, FaceAnalysis)>) = all_faces
-        .iter()
-        .map(|pair| (pair.1.embedding.clone(), pair))
-        .unzip();
+    // Move embeddings into HDBSCAN's contiguous input without cloning the 512-value vectors.
+    // They are moved back into their corresponding analyses after clustering.
+    let embeddings: Vec<Vec<f32>> = all_faces
+        .iter_mut()
+        .map(|(_, face)| std::mem::take(&mut face.embedding))
+        .collect();
 
     if embeddings.is_empty() {
         return Ok(HashMap::new());
@@ -142,14 +189,19 @@ pub fn cluster_faces<P: AsRef<Path> + Sync + Send>(
     let labels: Vec<i32> = clusterer
         .cluster()
         .map_err(|e| FaceIdError::Clustering(e.to_string()))?;
+    if labels.len() != all_faces.len() {
+        return Err(FaceIdError::Clustering(format!(
+            "Expected {} labels, got {}",
+            all_faces.len(),
+            labels.len()
+        )));
+    }
 
     let mut clusters: HashMap<i32, Vec<(PathBuf, FaceAnalysis)>> = HashMap::new();
-    for (idx, &label) in labels.iter().enumerate() {
-        let (path, face) = face_refs[idx];
-        clusters
-            .entry(label)
-            .or_default()
-            .push((path.clone(), face.clone()));
+    for (((path, mut face), embedding), label) in all_faces.into_iter().zip(embeddings).zip(labels)
+    {
+        face.embedding = embedding;
+        clusters.entry(label).or_default().push((path, face));
     }
 
     Ok(clusters)
@@ -175,9 +227,7 @@ mod tests {
 
         let thumbnail = extract_face_thumbnail(&img, &bbox, 4.0, 100);
 
-        // Expected dimensions: fitting 25x40 into 100x100 results in ~63x100
-        assert_ne!(thumbnail.width(), thumbnail.height());
-        assert_eq!(thumbnail.width(), 63);
+        assert_eq!(thumbnail.width(), 100);
         assert_eq!(thumbnail.height(), 100);
     }
 }

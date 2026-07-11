@@ -3,6 +3,7 @@ use crate::embedder::ArcFaceEmbedder;
 use crate::error::FaceIdError;
 use crate::face_align::norm_crop;
 use crate::gender_age::{Gender, GenderAgeEstimator};
+#[cfg(feature = "hf-hub")]
 use crate::model_manager::HfModel;
 use bon::bon;
 use image::DynamicImage;
@@ -10,6 +11,8 @@ use ort::ep::ExecutionProviderDispatch;
 use rayon::prelude::*;
 use std::path::Path;
 use std::sync::Mutex;
+
+const ANALYSIS_BATCH_SIZE: usize = 64;
 
 /// Result of face analysis.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,8 +113,6 @@ impl FaceAnalyzer {
 
     /// Performs the full pipeline: detection -> alignment -> embedding -> gender/age estimation.
     pub fn analyze(&self, img: &DynamicImage) -> Result<Vec<FaceAnalysis>, FaceIdError> {
-        let rgb_img = img.to_rgb8();
-
         // Detect face bounding boxes & landmarks
         let results = self
             .detector
@@ -123,64 +124,99 @@ impl FaceAnalyzer {
             return Ok(vec![]);
         }
 
-        let embed_crops: Vec<_> = results
-            .par_iter()
-            .map(|res| {
-                let landmarks = res.landmarks.as_ref().ok_or_else(|| {
-                    FaceIdError::InvalidModel(
-                        "One or more faces missing landmarks for embedding".into(),
-                    )
-                })?;
-                let lms_array: [(f32, f32); 5] = landmarks
-                    .iter()
-                    .map(|&(x, y)| (x * rgb_img.width() as f32, y * rgb_img.height() as f32))
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .map_err(|_| {
-                        FaceIdError::InvalidModel("Landmarks were not 5-point keypoints".into())
+        // Delay the full-size conversion until detection confirms that there is work to do.
+        let rgb_img = img.to_rgb8();
+        let img_width = rgb_img.width() as f32;
+        let img_height = rgb_img.height() as f32;
+        let result_count = results.len();
+        let mut final_results = Vec::with_capacity(result_count);
+        let mut remaining = results.into_iter();
+
+        // Bound inference tensor sizes. A malicious/overly permissive detector must not turn all
+        // retained faces into a single multi-gigabyte embedding allocation.
+        loop {
+            let batch: Vec<_> = remaining.by_ref().take(ANALYSIS_BATCH_SIZE).collect();
+            if batch.is_empty() {
+                break;
+            }
+
+            let embed_crops: Vec<_> = batch
+                .par_iter()
+                .map(|res| {
+                    let landmarks = res.landmarks.as_ref().ok_or_else(|| {
+                        FaceIdError::InvalidModel(
+                            "One or more faces missing landmarks for embedding".into(),
+                        )
                     })?;
-                Ok(norm_crop(&rgb_img, &lms_array, 112))
-            })
-            .collect::<Result<Vec<_>, FaceIdError>>()?;
+                    let relative: [(f32, f32); 5] =
+                        landmarks.as_slice().try_into().map_err(|_| {
+                            FaceIdError::InvalidModel("Landmarks were not 5-point keypoints".into())
+                        })?;
+                    let absolute = relative.map(|(x, y)| (x * img_width, y * img_height));
+                    let min_x = absolute
+                        .iter()
+                        .map(|point| point.0)
+                        .fold(f32::INFINITY, f32::min);
+                    let max_x = absolute
+                        .iter()
+                        .map(|point| point.0)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let min_y = absolute
+                        .iter()
+                        .map(|point| point.1)
+                        .fold(f32::INFINITY, f32::min);
+                    let max_y = absolute
+                        .iter()
+                        .map(|point| point.1)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    if !min_x.is_finite()
+                        || !max_x.is_finite()
+                        || !min_y.is_finite()
+                        || !max_y.is_finite()
+                        || (max_x - min_x).max(max_y - min_y) < 1e-3
+                    {
+                        return Err(FaceIdError::InvalidModel(
+                            "Face landmarks are non-finite or degenerate".into(),
+                        ));
+                    }
+                    Ok(norm_crop(&rgb_img, &absolute, 112))
+                })
+                .collect::<Result<Vec<_>, FaceIdError>>()?;
 
-        let embeddings = self
-            .embedder
-            .lock()
-            .map_err(|_| FaceIdError::MutexPoisoned("Embedder".into()))?
-            .compute_embeddings_batch(&embed_crops)?;
+            let embeddings = self
+                .embedder
+                .lock()
+                .map_err(|_| FaceIdError::MutexPoisoned("Embedder".into()))?
+                .compute_embeddings_batch(&embed_crops)?;
 
-        // Gender/Age: Alignment & Batch Inference
-        let ga_crops: Vec<_> = results
-            .par_iter()
-            .map(|res| GenderAgeEstimator::align_crop(&rgb_img, &res.bbox, 96))
-            .collect();
+            let ga_crops: Vec<_> = batch
+                .par_iter()
+                .map(|res| GenderAgeEstimator::align_crop(&rgb_img, &res.bbox, 96))
+                .collect();
+            let ga_results = self
+                .gender_age
+                .lock()
+                .map_err(|_| FaceIdError::MutexPoisoned("GenderAge".into()))?
+                .estimate_batch(&ga_crops)?;
 
-        let ga_results = self
-            .gender_age
-            .lock()
-            .map_err(|_| FaceIdError::MutexPoisoned("GenderAge".into()))?
-            .estimate_batch(&ga_crops)?;
+            if embeddings.len() != batch.len() || ga_results.len() != batch.len() {
+                return Err(FaceIdError::Ort(format!(
+                    "Inconsistent batch results: expected {}, got {} embeddings and {} gender/age results",
+                    batch.len(),
+                    embeddings.len(),
+                    ga_results.len()
+                )));
+            }
 
-        if embeddings.len() != results.len() || ga_results.len() != results.len() {
-            return Err(FaceIdError::Ort(format!(
-                "Inconsistent batch results: expected {}, got {} embeddings and {} ga results",
-                results.len(),
-                embeddings.len(),
-                ga_results.len()
-            )));
+            final_results.extend(batch.into_iter().zip(embeddings).zip(ga_results).map(
+                |((detection, embedding), attributes)| FaceAnalysis {
+                    detection,
+                    embedding,
+                    gender: attributes.gender,
+                    age: attributes.age,
+                },
+            ));
         }
-
-        let final_results = results
-            .into_iter()
-            .zip(embeddings)
-            .zip(ga_results)
-            .map(|((det, emb), ga)| FaceAnalysis {
-                detection: det,
-                embedding: emb,
-                gender: ga.gender,
-                age: ga.age,
-            })
-            .collect();
 
         Ok(final_results)
     }

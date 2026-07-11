@@ -23,9 +23,10 @@
 //! The [`analyzer::FaceAnalyzer`] is the main entry point. It manages the sub-models
 //! and performs batch inference for efficiency.
 //!
-//! ```rust
+//! ```rust,no_run
 //! use face_id::analyzer::FaceAnalyzer;
 //!
+//! # #[cfg(feature = "hf-hub")]
 //! #[tokio::main]
 //! async fn main() -> color_eyre::Result<()> {
 //!     // Initialize the analyzer.
@@ -46,6 +47,8 @@
 //!     }
 //!     Ok(())
 //! }
+//! # #[cfg(not(feature = "hf-hub"))]
+//! # fn main() {}
 //! ```
 //!
 //! ## Individual Components
@@ -56,8 +59,9 @@
 //! Use [`detector::ScrfdDetector`] to find faces. Bounding boxes and landmarks are returned in **relative** coordinates.
 //! To convert them back to absolute pixels, use [`detector::DetectedFace::to_absolute`].
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use face_id::detector::ScrfdDetector;
+//! # #[cfg(feature = "hf-hub")]
 //! # async fn run() -> color_eyre::Result<()> {
 //! let mut detector = ScrfdDetector::from_hf().build().await?;
 //! let detections = detector.detect(&image::open("input.jpg")?)?;
@@ -69,9 +73,10 @@
 //! Recognition models like `ArcFace` require faces to be "aligned"—rotated and scaled so that
 //! landmarks are in specific positions.
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use face_id::embedder::ArcFaceEmbedder;
 //! # use face_id::face_align::norm_crop;
+//! # #[cfg(feature = "hf-hub")]
 //! # async fn run(img: image::DynamicImage, landmarks: [(f32, f32); 5]) -> color_eyre::Result<()> {
 //! let mut embedder = ArcFaceEmbedder::from_hf().build().await?;
 //!
@@ -109,10 +114,11 @@
 //! You can mix and match specific model versions from Hugging Face repositories.
 //! For example, using the medium-complexity `10g_bnkps` detector instead of the default:
 //!
-//! ```rust
+//! ```rust,no_run
 //! use face_id::analyzer::FaceAnalyzer;
 //! use face_id::model_manager::HfModel;
 //!
+//! # #[cfg(feature = "hf-hub")]
 //! #[tokio::main]
 //! async fn main() -> color_eyre::Result<()> {
 //!     let analyzer = FaceAnalyzer::from_hf()
@@ -130,18 +136,22 @@
 //!
 //!     Ok(())
 //! }
+//! # #[cfg(not(feature = "hf-hub"))]
+//! # fn main() {}
 //! ```
 //!
 //! ## Face Clustering & Cropping helpers
 //!
 //! You can cluster faces from multiple images and then extract high-quality thumbnails for the results.
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use std::fmt::format;
 //! use face_id::analyzer::FaceAnalyzer;
+//! # #[cfg(all(feature = "hf-hub", feature = "clustering"))]
 //! # use face_id::helpers::{cluster_faces, extract_face_thumbnail};
 //! # use std::path::PathBuf;
 //! # use face_id::analyzer::FaceAnalysis;
+//! # #[cfg(all(feature = "hf-hub", feature = "clustering"))]
 //! # async fn run() -> color_eyre::Result<()> {
 //! # let analyzer = FaceAnalyzer::from_hf().build().await?;
 //! let paths = vec!["img1.jpg", "img2.jpg"];
@@ -172,10 +182,11 @@
 //! This crate supports a variety of Execution Providers (EPs) via `ort`. To use a specific GPU
 //! backend, enable the corresponding feature in your `Cargo.toml` (e.g., `cuda`, `tensorrt`, `coreml`).
 //!
-//! ```rust
+//! ```rust,no_run
 //! use face_id::analyzer::FaceAnalyzer;
 //! use ort::ep::{DirectML, TensorRT, CUDA, CoreML};
 //!
+//! # #[cfg(feature = "hf-hub")]
 //! # async fn run() -> color_eyre::Result<()> {
 //! let analyzer = FaceAnalyzer::from_hf()
 //!     .with_execution_providers(&[
@@ -196,6 +207,7 @@
 //! - `copy-dylibs` / `download-binaries` (Default): Simplifies `ort` setup.
 //! - `serde`: Enables serialization/deserialization for results.
 //! - `clustering` (Default): Enables face clustering using HDBSCAN.
+//! - `network-tests`: Enables the opt-in Hugging Face model/reference integration test.
 //! - **Execution Providers**: `cuda`, `tensorrt`, `coreml`, `directml`, `openvino`, etc.
 
 #![allow(

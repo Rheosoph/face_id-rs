@@ -9,14 +9,14 @@ fmt:
 
 # Run Clippy with the same strict flags used in CI
 clippy:
-    cargo clippy --no-deps --all-features --tests --benches -- \
+    cargo clippy --locked --no-deps --all-features --all-targets -- \
         -D clippy::all \
         -D clippy::pedantic \
         -D clippy::nursery
 
 # Run all tests including integration tests
 test:
-    cargo test --profile release
+    cargo test --profile release --locked
 
 # Run benchmarks
 bench:

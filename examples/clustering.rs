@@ -4,7 +4,6 @@ use color_eyre::eyre::Result;
 use face_id::analyzer::{FaceAnalysis, FaceAnalyzer};
 use face_id::helpers::{cluster_faces, extract_face_thumbnail};
 use image::RgbImage;
-use ort::ep::CUDA;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
@@ -16,7 +15,9 @@ use walkdir::WalkDir;
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let input_dir = "/home/ruurd/Pictures/Photos";
+    let input_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "assets/img".to_owned());
     let output_base = Path::new("output_previews/clusters");
     if output_base.exists() {
         fs::remove_dir_all(output_base)?;
@@ -24,13 +25,10 @@ async fn main() -> Result<()> {
     fs::create_dir_all(output_base)?;
 
     println!("Initializing models...");
-    let analyzer = FaceAnalyzer::from_hf()
-        .with_execution_providers(&[CUDA::default().build().error_on_failure()])
-        .build()
-        .await?;
+    let analyzer = FaceAnalyzer::from_hf().build().await?;
 
     println!("Scanning directory: {input_dir}");
-    let image_paths: Vec<PathBuf> = WalkDir::new(input_dir)
+    let image_paths: Vec<PathBuf> = WalkDir::new(&input_dir)
         .into_iter()
         .filter_map(std::result::Result::ok)
         .map(|e| e.path().to_path_buf())
@@ -82,8 +80,13 @@ async fn main() -> Result<()> {
             }
 
             // Determine grid dimensions
-            let cols = (count as f32).sqrt().ceil() as u32;
-            let rows = (count as f32 / cols as f32).ceil() as u32;
+            let floor_sqrt = count.isqrt();
+            let cols = floor_sqrt + usize::from(floor_sqrt * floor_sqrt < count);
+            let rows = count.div_ceil(cols);
+            let (Ok(cols), Ok(rows)) = (u32::try_from(cols), u32::try_from(rows)) else {
+                eprintln!("Cluster is too large to render as an image");
+                return;
+            };
 
             let mut grid_img = RgbImage::new(cols * thumb_size, rows * thumb_size);
 
@@ -103,7 +106,7 @@ async fn main() -> Result<()> {
                 let x = (member_idx as u32 % cols) * thumb_size;
                 let y = (member_idx as u32 / cols) * thumb_size;
 
-                image::imageops::replace(&mut grid_img, &thumbnail, x as i64, y as i64);
+                image::imageops::replace(&mut grid_img, &thumbnail, i64::from(x), i64::from(y));
             }
 
             let out_name = format!("{cluster_name}.jpg");

@@ -27,8 +27,8 @@ async fn main() -> Result<()> {
     }
     println!("Loading models (Detector, Embedder, Gender/Age)...");
     let analyzer = FaceAnalyzer::from_hf().build().await?;
-    let font_data = include_bytes!("../assets/font/Roboto-Medium.ttf");
-    let font = FontRef::try_from_slice(font_data)?;
+    let font_data = fs::read("assets/font/Roboto-Medium.ttf")?;
+    let font = FontRef::try_from_slice(&font_data)?;
 
     let mut all_results = Vec::new();
     println!("Processing images in: {img_dir}");

@@ -1,6 +1,8 @@
+#[cfg(feature = "hf-hub")]
 use crate::error::FaceIdError;
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::tokio::Api;
+#[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
 
 pub struct HfModel {

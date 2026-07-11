@@ -3,7 +3,7 @@ use crate::error::FaceIdError;
 use crate::model_manager::{HfModel, get_hf_model};
 use bon::bon;
 use image::{ImageBuffer, Rgb};
-use ndarray::{Array2, Array4, Axis, s};
+use ndarray::{Array2, Array4, s};
 use ort::ep::ExecutionProviderDispatch;
 use ort::session::Session;
 use ort::value::Value;
@@ -37,7 +37,15 @@ impl ArcFaceEmbedder {
             .with_execution_providers(with_execution_providers)?
             .commit_from_file(model_path)?;
 
-        let input_name = session.inputs()[0].name().to_string();
+        let input_name = session
+            .inputs()
+            .first()
+            .ok_or_else(|| FaceIdError::InvalidModel("Embedder has no inputs".into()))?
+            .name()
+            .to_string();
+        if session.outputs().is_empty() {
+            return Err(FaceIdError::InvalidModel("Embedder has no outputs".into()));
+        }
 
         Ok(Self {
             session,
@@ -60,7 +68,11 @@ impl ArcFaceEmbedder {
             .session
             .run(ort::inputs![&self.input_name => input_value])?;
 
-        let mut output_tensor = outputs[0]
+        let output = outputs
+            .values()
+            .next()
+            .ok_or_else(|| FaceIdError::InvalidModel("Embedder produced no outputs".into()))?;
+        let mut output_tensor = output
             .try_extract_array::<f32>()?
             .to_owned()
             .into_dimensionality::<ndarray::Ix2>()?;
@@ -71,6 +83,16 @@ impl ArcFaceEmbedder {
                 "Embedder batch size mismatch: expected {expected_batch_size}, got {}",
                 output_tensor.shape()[0]
             )));
+        }
+        if output_tensor.shape()[1] == 0 {
+            return Err(FaceIdError::InvalidModel(
+                "Embedder produced empty embeddings".into(),
+            ));
+        }
+        if output_tensor.iter().any(|value| !value.is_finite()) {
+            return Err(FaceIdError::InvalidModel(
+                "Embedder produced non-finite values".into(),
+            ));
         }
 
         Self::l2_normalize_batch(&mut output_tensor);
@@ -136,14 +158,14 @@ impl ArcFaceEmbedder {
         Self::create_input_tensor_batch(std::slice::from_ref(img))
     }
 
-    /// Performs vectorized L2 normalization on a 2D array of embeddings [N, Dim] in-place.
+    /// Performs L2 normalization on every row of an `[N, Dim]` embedding array in-place.
     pub fn l2_normalize_batch(embeddings: &mut Array2<f32>) {
-        let view = embeddings.view();
-        let sq_sums = (&view * &view).sum_axis(Axis(1));
-        let inv_norms = sq_sums
-            .mapv(|x| 1.0 / x.max(1e-12).sqrt())
-            .insert_axis(Axis(1));
-        *embeddings *= &inv_norms;
+        for mut embedding in embeddings.rows_mut() {
+            let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 1e-12 {
+                embedding *= 1.0 / norm;
+            }
+        }
     }
 
     /// Normalizes a single vector.
@@ -161,6 +183,47 @@ impl ArcFaceEmbedder {
     /// Range: -1.0 to 1.0 (Higher is more similar).
     #[must_use]
     pub fn compute_similarity(emb1: &[f32], emb2: &[f32]) -> f32 {
-        emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum()
+        Self::try_compute_similarity(emb1, emb2).unwrap_or(f32::NAN)
+    }
+
+    /// Computes cosine similarity after validating that both embeddings have the same size.
+    ///
+    /// Prefer this checked variant when embeddings may come from different models. The legacy
+    /// [`Self::compute_similarity`] method returns `NaN` for invalid input instead of silently
+    /// truncating the longer vector.
+    pub fn try_compute_similarity(emb1: &[f32], emb2: &[f32]) -> Result<f32, FaceIdError> {
+        if emb1.is_empty() || emb1.len() != emb2.len() {
+            return Err(FaceIdError::InvalidModel(format!(
+                "Embedding lengths must be equal and non-zero, got {} and {}",
+                emb1.len(),
+                emb2.len()
+            )));
+        }
+        if emb1.iter().chain(emb2).any(|value| !value.is_finite()) {
+            return Err(FaceIdError::InvalidModel(
+                "Embeddings must contain only finite values".into(),
+            ));
+        }
+        Ok(emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_similarity_rejects_different_lengths() {
+        assert!(ArcFaceEmbedder::try_compute_similarity(&[1.0], &[1.0, 0.0]).is_err());
+        assert!(ArcFaceEmbedder::compute_similarity(&[1.0], &[1.0, 0.0]).is_nan());
+    }
+
+    #[test]
+    fn batch_normalization_handles_zero_rows() {
+        let mut embeddings = Array2::from_shape_vec((2, 2), vec![3.0, 4.0, 0.0, 0.0]).unwrap();
+        ArcFaceEmbedder::l2_normalize_batch(&mut embeddings);
+        assert!((embeddings[[0, 0]] - 0.6).abs() < 1e-6);
+        assert!((embeddings[[0, 1]] - 0.8).abs() < 1e-6);
+        assert_eq!(embeddings.row(1).as_slice().unwrap(), &[0.0, 0.0]);
     }
 }

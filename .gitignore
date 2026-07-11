@@ -2,3 +2,6 @@
 .idea
 output.jpg
 output_previews/*
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md

@@ -227,6 +227,22 @@ The default recognition model is `w600k_r50.onnx` (ResNet-50) from the InsightFa
 - `clustering` (Default): Enables face clustering using HDBSCAN.
 - **Execution Providers**: `cuda`, `tensorrt`, `coreml`, `directml`, `openvino`, etc.
 
+For mobile, offline, or otherwise hermetic builds, disable this crate's defaults and provide ONNX Runtime through your
+application's platform-specific setup:
+
+```toml
+face_id = { version = "0.4.2", default-features = false }
+```
+
+This minimal configuration enables only the ONNX Runtime API, `std`, and `ndarray` integration. It does not download
+ORT binaries, copy dynamic libraries, initialize TLS, download Hugging Face models, or include image decoders.
+
+The network-backed model/reference integration test is opt-in:
+
+```shell
+cargo test --release --features network-tests --test integration_test
+```
+
 ## Troubleshooting
 
 ### Dynamic Linking

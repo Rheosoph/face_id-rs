@@ -10,6 +10,73 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Rust 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+      - name: Check minimum supported Rust version
+        run: cargo check --no-default-features --locked
+
+  feature-contract:
+    name: Feature contract
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Check minimal feature set
+        run: cargo check --no-default-features --locked --offline
+      - name: Check minimal iOS build
+        run: |
+          rustup target add aarch64-apple-ios
+          cargo check --target aarch64-apple-ios --no-default-features --locked --offline
+      - name: Ensure minimal builds do not enable ORT downloads or dylib copying
+        shell: bash
+        run: |
+          ort_features="$(cargo tree --target aarch64-apple-ios --no-default-features --locked -e features -i ort)"
+          if grep -Eq 'ort feature "(default|download-binaries|copy-dylibs|tls-native|tls-rustls|tracing)"' <<<"$ort_features"; then
+            echo "$ort_features"
+            echo "Minimal face_id builds must not enable ORT defaults, downloads, dylib copying, TLS, or tracing."
+            exit 1
+          fi
+      - name: Run hermetic unit tests
+        run: cargo test --lib --no-default-features --features load-dynamic --locked --offline
+      - name: Check minimal-feature documentation
+        run: cargo test --doc --no-default-features --locked --offline
+
+  package:
+    name: Published package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+      - name: Build package
+        run: cargo package --locked
+      - name: Check all packaged targets
+        shell: bash
+        run: |
+          package_dir="$(find target/package -maxdepth 1 -type d -name 'face_id-*' -print -quit)"
+          test -n "$package_dir"
+          cargo check --manifest-path "$package_dir/Cargo.toml" --all-targets --locked
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -24,7 +91,7 @@ jobs:
         with:
           key: ${{ github.job }}
       - name: Run Clippy
-        run: cargo clippy --no-deps --all-features --tests --benches -- -D clippy::all -D clippy::pedantic -D clippy::nursery
+        run: cargo clippy --locked --no-deps --all-features --all-targets -- -D clippy::all -D clippy::pedantic -D clippy::nursery
 
   test:
     name: Tests
@@ -38,4 +105,4 @@ jobs:
         with:
           key: ${{ github.job }}
       - name: Run Tests
-        run: cargo test --release
+        run: cargo test --release --locked

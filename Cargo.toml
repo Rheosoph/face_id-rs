@@ -1,7 +1,8 @@
 [package]
 name = "face_id"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
+rust-version = "1.88"
 exclude = ["assets", ".github", "output_previews", "justfile"]
 description = "Face detection (bounding boxes, eyes/nose/mouth markers), and facial recognition (embeddings)."
 repository = "https://github.com/RuurdBijlsma/face_id-rs"
@@ -10,37 +11,35 @@ license-file = "LICENSE"
 documentation = "https://docs.rs/face_id"
 
 [dependencies]
-ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["api-24", "ndarray", "std"] }
 ndarray = "0.17.2"
-nalgebra = "0.34.1"
+nalgebra = { version = "0.34.1", default-features = false, features = ["std"] }
 thiserror = "2.0.18"
-image = { version = "0.25.9", features = ["rayon"] }
+image = { version = "0.25.9", default-features = false, features = ["rayon"] }
 serde = { version = "1.0.228", optional = true, features = ["derive"] }
-serde_json = { version = "1.0.149", optional = true }
-hf-hub = { version = "0.5.0", features = ["tokio"], optional = true }
+hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls"], optional = true }
 bon = "3.9.0"
 rayon = "1.10"
 hdbscan = { version = "0.12.0", optional = true }
 
 [dev-dependencies]
 color-eyre = "0.6.5"
-serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149" }
-imageproc = "0.26.1"
+imageproc = { version = "0.26.1", default-features = false, features = ["text"] }
 criterion = { version = "0.8.1", features = ["html_reports"] }
 ab_glyph = "0.2.32"
 tokio = { version = "1.50", features = ["rt", "macros"] }
 walkdir = "2.5.0"
-hdbscan = "0.12.0"
 
 [features]
 default = ["download-binaries", "copy-dylibs", "hf-hub", "serde", "clustering"]
-serde = ["dep:serde", "dep:serde_json"]
-clustering = ["dep:hdbscan"]
-download-binaries = ["ort/download-binaries"]
+serde = ["dep:serde"]
+clustering = ["dep:hdbscan", "image/default-formats"]
+download-binaries = ["ort/download-binaries", "ort/tls-rustls"]
 copy-dylibs = ["ort/copy-dylibs"]
 load-dynamic = ["ort/load-dynamic"]
 hf-hub = ["dep:hf-hub"] # -> Enable downloading models from HuggingFace, relies on `tokio`
+network-tests = ["hf-hub"]
 # ort execution providers
 cuda = ["ort/cuda"]
 tensorrt = ["ort/tensorrt"]
@@ -65,3 +64,8 @@ azure = ["ort/azure"]
 [[bench]]
 name = "face_id"
 harness = false
+
+[[test]]
+name = "integration_test"
+path = "tests/integration_test.rs"
+required-features = ["network-tests"]
