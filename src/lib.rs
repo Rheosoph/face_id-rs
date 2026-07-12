@@ -225,3 +225,4 @@ pub mod face_align;
 pub mod gender_age;
 pub mod helpers;
 pub mod model_manager;
+mod session;

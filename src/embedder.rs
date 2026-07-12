@@ -33,8 +33,7 @@ impl ArcFaceEmbedder {
         #[builder(start_fn)] model_path: impl AsRef<Path>,
         #[builder(default = &[])] with_execution_providers: &[ExecutionProviderDispatch],
     ) -> Result<Self, FaceIdError> {
-        let session = Session::builder()?
-            .with_execution_providers(with_execution_providers)?
+        let session = crate::session::configured_session_builder(with_execution_providers)?
             .commit_from_file(model_path)?;
 
         let input_name = session

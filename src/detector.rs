@@ -150,8 +150,7 @@ impl ScrfdDetector {
             )));
         }
 
-        let session = Session::builder()?
-            .with_execution_providers(with_execution_providers)?
+        let session = crate::session::configured_session_builder(with_execution_providers)?
             .commit_from_file(model_path)?;
         let input_name = session
             .inputs()
